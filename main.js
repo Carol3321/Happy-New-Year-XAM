@@ -1,0 +1,665 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { GestureEngine, followRotation, FINGER_DEFS } from './gesture-engine.mjs';
+
+const CONFIG = {
+  colors: { bg: 0x000000, champagneGold: 0xffd966, deepGreen: 0x03180a, accentRed: 0x990000 },
+  particles: { count: 1500, dustCount: 2500, treeHeight: 24, treeRadius: 8 },
+  camera: { z: 50 }
+};
+
+const STATE = {
+  // focusIndex 从 0 开始：第一次捏合会翻到第 2 张（第 1 张是默认的 JOYEUX NOEL 占位卡）
+  mode: 'TREE', focusIndex: 0, focusTarget: null,
+  hand: { detected: false, x: 0, y: 0 },
+  rotation: { x: 0, y: 0 }
+};
+
+let scene, camera, renderer, composer;
+let mainGroup;
+let clock = new THREE.Clock();
+let particleSystem = [];
+let photoMeshGroup = new THREE.Group();
+let handLandmarker, video, webcamCanvas, webcamCtx;
+let caneTexture;
+
+// 手势引擎：所有判定逻辑都在 gesture-engine.mjs 里，这里只负责“读懂结果”
+const gestures = new GestureEngine();
+let lastPose = null;          // 最近一帧的手势快照，给 UI / 预览用
+let lastLandmarks = null;     // 最近一帧原始关键点
+
+async function init() {
+  initThree();
+  setupEnvironment();
+  setupLights();
+  createTextures();
+  createParticles();
+  createDust();
+  createDefaultPhotos();
+  setupPostProcessing();
+  setupEvents();
+  cacheUi();
+  await Promise.race([
+    initMediaPipe(),
+    new Promise(resolve => setTimeout(resolve, 8000))
+  ]).catch(err => console.warn('MediaPipe init skipped:', err));
+
+  const loader = document.getElementById('loader');
+  if (loader) {
+    loader.style.opacity = 0;
+    setTimeout(() => loader.remove(), 800);
+  }
+  animate();
+}
+
+function initThree() {
+  const container = document.getElementById('canvas-container');
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(CONFIG.colors.bg);
+  scene.fog = new THREE.FogExp2(CONFIG.colors.bg, 0.01);
+  camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 1000);
+  camera.position.set(0, 2, CONFIG.camera.z);
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.toneMapping = THREE.ReinhardToneMapping;
+  renderer.toneMappingExposure = 2.2;
+  container.appendChild(renderer.domElement);
+  mainGroup = new THREE.Group();
+  // 整体下移一点，给顶部标题（Happy New Year / XAM）留出呼吸空间
+  mainGroup.position.y = -1.2;
+  scene.add(mainGroup);
+}
+
+function setupEnvironment() {
+  const pmremGenerator = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+}
+
+function setupLights() {
+  const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+  scene.add(ambient);
+  const innerLight = new THREE.PointLight(0xffaa00, 2, 20);
+  innerLight.position.set(0, 5, 0);
+  mainGroup.add(innerLight);
+  const spotGold = new THREE.SpotLight(0xffcc66, 1200);
+  spotGold.position.set(30, 40, 40);
+  spotGold.angle = 0.5;
+  spotGold.penumbra = 0.5;
+  scene.add(spotGold);
+  const spotBlue = new THREE.SpotLight(0x6688ff, 600);
+  spotBlue.position.set(-30, 20, -30);
+  scene.add(spotBlue);
+  const fill = new THREE.DirectionalLight(0xffeebb, 0.8);
+  fill.position.set(0, 0, 50);
+  scene.add(fill);
+}
+
+function setupPostProcessing() {
+  const renderScene = new RenderPass(scene, camera);
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+  bloomPass.threshold = 0.7;
+  bloomPass.strength = 0.45;
+  bloomPass.radius = 0.4;
+  composer = new EffectComposer(renderer);
+  composer.addPass(renderScene);
+  composer.addPass(bloomPass);
+}
+
+function createTextures() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128; canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,128,128);
+  ctx.fillStyle = '#880000';
+  ctx.beginPath();
+  for(let i=-128; i<256; i+=32) {
+    ctx.moveTo(i, 0); ctx.lineTo(i+32, 128); ctx.lineTo(i+16, 128); ctx.lineTo(i-16, 0);
+  }
+  ctx.fill();
+  caneTexture = new THREE.CanvasTexture(canvas);
+  caneTexture.wrapS = THREE.RepeatWrapping;
+  caneTexture.wrapT = THREE.RepeatWrapping;
+  caneTexture.repeat.set(3, 3);
+}
+
+const _tmpScale = new THREE.Vector3();
+
+class Particle {
+  constructor(mesh, type, isDust = false) {    this.mesh = mesh;
+    this.type = type;
+    this.isDust = isDust;
+    this.posTree = new THREE.Vector3();
+    this.posScatter = new THREE.Vector3();
+    this.baseScale = mesh.scale.x;
+    const speedMult = (type === 'PHOTO') ? 0.3 : 2.0;
+    this.spinSpeed = new THREE.Vector3(
+      (Math.random() - 0.5) * speedMult,
+      (Math.random() - 0.5) * speedMult,
+      (Math.random() - 0.5) * speedMult
+    );
+    this.calculatePositions();
+  }
+  calculatePositions() {
+    const h = CONFIG.particles.treeHeight;
+    const halfH = h / 2;
+    let t = Math.random();
+    t = Math.pow(t, 0.8);
+    const y = (t * h) - halfH;
+    let rMax = CONFIG.particles.treeRadius * (1.0 - t);
+    if (rMax < 0.5) rMax = 0.5;
+    const angle = t * 50 * Math.PI + Math.random() * Math.PI;
+    const r = rMax * (0.8 + Math.random() * 0.4);
+    this.posTree.set(Math.cos(angle) * r, y, Math.sin(angle) * r);
+    let rScatter = this.isDust ? (12 + Math.random()*20) : (8 + Math.random()*12);
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    this.posScatter.set(
+      rScatter * Math.sin(phi) * Math.cos(theta),
+      rScatter * Math.sin(phi) * Math.sin(theta),
+      rScatter * Math.cos(phi)
+    );
+  }
+  update(dt, mode, focusTargetMesh) {
+    let target = this.posTree;
+    if (mode === 'SCATTER') target = this.posScatter;
+    else if (mode === 'FOCUS') {
+      if (this.mesh === focusTargetMesh) {
+        const desiredWorldPos = new THREE.Vector3(0, 2, 35);
+        const invMatrix = new THREE.Matrix4().copy(mainGroup.matrixWorld).invert();
+        target = desiredWorldPos.applyMatrix4(invMatrix);
+      } else { target = this.posScatter; }
+    }
+    const isFocusTarget = mode === 'FOCUS' && this.mesh === focusTargetMesh;
+    const lerpSpeed = isFocusTarget ? 5.0 : 2.0;
+    // 指数衰减插值：与帧率无关，60Hz / 144Hz 手感一致
+    this.mesh.position.lerp(target, 1 - Math.exp(-lerpSpeed * dt));
+    if (mode === 'SCATTER') {
+      this.mesh.rotation.x += this.spinSpeed.x * dt;
+      this.mesh.rotation.y += this.spinSpeed.y * dt;
+      this.mesh.rotation.z += this.spinSpeed.z * dt;
+    } else if (mode === 'TREE') {
+      this.mesh.rotation.x = THREE.MathUtils.lerp(this.mesh.rotation.x, 0, dt);
+      this.mesh.rotation.z = THREE.MathUtils.lerp(this.mesh.rotation.z, 0, dt);
+      this.mesh.rotation.y += 0.5 * dt;
+    }
+    if (isFocusTarget) {
+      this.mesh.lookAt(camera.position);
+    }
+    let s = this.baseScale;
+    if (this.isDust) {
+      s = this.baseScale * (0.8 + 0.4 * Math.sin(clock.elapsedTime * 4 + this.mesh.id));
+      if (mode === 'TREE') s = 0;
+    } else if (mode === 'SCATTER' && this.type === 'PHOTO') {
+      s = this.baseScale * 2.5;
+    } else if (mode === 'FOCUS') {
+      if (isFocusTarget) s = 4.5;
+      else s = this.baseScale * 0.8;
+    }
+    this.mesh.scale.lerp(_tmpScale.set(s, s, s), 1 - Math.exp(-4 * dt));
+  }
+}
+
+function createParticles() {
+  const sphereGeo = new THREE.SphereGeometry(0.5, 32, 32);
+  const boxGeo = new THREE.BoxGeometry(0.55, 0.55, 0.55);
+  const curve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, -0.5, 0), new THREE.Vector3(0, 0.3, 0),
+    new THREE.Vector3(0.1, 0.5, 0), new THREE.Vector3(0.3, 0.4, 0)
+  ]);
+  const candyGeo = new THREE.TubeGeometry(curve, 16, 0.08, 8, false);
+  const goldMat = new THREE.MeshStandardMaterial({
+    color: CONFIG.colors.champagneGold, metalness: 1.0, roughness: 0.1,
+    envMapIntensity: 2.0, emissive: 0x443300, emissiveIntensity: 0.3
+  });
+  const greenMat = new THREE.MeshStandardMaterial({
+    color: CONFIG.colors.deepGreen, metalness: 0.2, roughness: 0.8,
+    emissive: 0x002200, emissiveIntensity: 0.2
+  });
+  const redMat = new THREE.MeshPhysicalMaterial({
+    color: CONFIG.colors.accentRed, metalness: 0.3, roughness: 0.2, clearcoat: 1.0,
+    emissive: 0x330000
+  });
+  const candyMat = new THREE.MeshStandardMaterial({ map: caneTexture, roughness: 0.4 });
+  for (let i = 0; i < CONFIG.particles.count; i++) {
+    const rand = Math.random();
+    let mesh, type;
+    if (rand < 0.40) { mesh = new THREE.Mesh(boxGeo, greenMat); type = 'BOX'; }
+    else if (rand < 0.70) { mesh = new THREE.Mesh(boxGeo, goldMat); type = 'GOLD_BOX'; }
+    else if (rand < 0.92) { mesh = new THREE.Mesh(sphereGeo, goldMat); type = 'GOLD_SPHERE'; }
+    else if (rand < 0.97) { mesh = new THREE.Mesh(sphereGeo, redMat); type = 'RED'; }
+    else { mesh = new THREE.Mesh(candyGeo, candyMat); type = 'CANE'; }
+    const s = 0.4 + Math.random() * 0.5;
+    mesh.scale.set(s,s,s);
+    mesh.rotation.set(Math.random()*6, Math.random()*6, Math.random()*6);
+    mainGroup.add(mesh);
+    particleSystem.push(new Particle(mesh, type, false));
+  }
+  const starGeo = new THREE.OctahedronGeometry(1.2, 0);
+  const starMat = new THREE.MeshStandardMaterial({
+    color: 0xffdd88, emissive: 0xffaa00, emissiveIntensity: 1.0, metalness: 1.0, roughness: 0
+  });
+  const star = new THREE.Mesh(starGeo, starMat);
+  star.position.set(0, CONFIG.particles.treeHeight/2 + 1.2, 0);
+  mainGroup.add(star);
+  mainGroup.add(photoMeshGroup);
+}
+
+function createDust() {
+  const geo = new THREE.TetrahedronGeometry(0.08, 0);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffeebb, transparent: true, opacity: 0.8 });
+  for(let i=0; i<CONFIG.particles.dustCount; i++) {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.scale.setScalar(0.5 + Math.random());
+    mainGroup.add(mesh);
+    particleSystem.push(new Particle(mesh, 'DUST', true));
+  }
+}
+
+function createDefaultPhotos() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512; canvas.height = 512;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#050505'; ctx.fillRect(0,0,512,512);
+  ctx.strokeStyle = '#eebb66'; ctx.lineWidth = 15; ctx.strokeRect(20,20,472,472);
+  ctx.font = '500 60px Times New Roman'; ctx.fillStyle = '#eebb66';
+  ctx.textAlign = 'center';
+  ctx.fillText("JOYEUX", 256, 230);
+  ctx.fillText("NOEL", 256, 300);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  addPhotoToScene(tex);
+}
+
+function addPhotoToScene(texture) {
+  const frameGeo = new THREE.BoxGeometry(1.4, 1.4, 0.05);
+  const frameMat = new THREE.MeshStandardMaterial({ color: CONFIG.colors.champagneGold, metalness: 1.0, roughness: 0.1 });
+  const frame = new THREE.Mesh(frameGeo, frameMat);
+  const photoGeo = new THREE.PlaneGeometry(1.2, 1.2);
+  const photoMat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+  const photo = new THREE.Mesh(photoGeo, photoMat);
+  photo.position.z = 0.04;
+  const group = new THREE.Group();
+  group.add(frame);
+  group.add(photo);
+  const s = 0.8;
+  group.scale.set(s,s,s);
+  photoMeshGroup.add(group);
+  particleSystem.push(new Particle(group, 'PHOTO', false));
+}
+
+function handleImageUpload(e) {
+  const files = e.target.files;
+  if(!files.length) return;
+  Array.from(files).forEach(f => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      new THREE.TextureLoader().load(ev.target.result, (t) => {
+        t.colorSpace = THREE.SRGBColorSpace;
+        addPhotoToScene(t);
+      });
+    }
+    reader.readAsDataURL(f);
+  });
+}
+
+// ============================================================
+//  MediaPipe：识别手部 21 个关键点
+// ============================================================
+async function initMediaPipe() {
+  video = document.getElementById('webcam');
+  webcamCanvas = document.getElementById('webcam-preview');
+  webcamCtx = webcamCanvas ? webcamCanvas.getContext('2d') : null;
+  if (webcamCanvas) { webcamCanvas.width = 192; webcamCanvas.height = 144; }
+  try {
+    const vision = await FilesetResolver.forVisionTasks("assets/wasm");
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "./assets/hand_landmarker.task",
+        delegate: "GPU"
+      },
+      runningMode: "VIDEO",
+      numHands: 1,
+      // 提高三个置信度阈值：宁可漏一帧，也不要把"像手的东西"当成手
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6
+    });
+    if (navigator.mediaDevices?.getUserMedia) {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' },
+        audio: false
+      });
+      video.srcObject = stream;
+      video.muted = true;
+      video.addEventListener("loadeddata", () => {
+        video.play().catch(() => {});
+        predictWebcam();
+      });
+    }
+  } catch (err) {
+    console.warn('MediaPipe / camera init failed:', err);
+    setHint('OFF');
+  }
+}
+
+let lastVideoTime = -1;
+let lastDetectAt = 0;
+async function predictWebcam() {
+  requestAnimationFrame(predictWebcam);
+  if (!video || video.readyState < 2) return;
+  if (video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  if (!handLandmarker) return;
+
+  const now = performance.now();
+  const dt = lastDetectAt ? (now - lastDetectAt) / 1000 : 1 / 30;
+  lastDetectAt = now;
+
+  const result = handLandmarker.detectForVideo(video, now);
+  processGestures(result, dt);
+}
+
+/**
+ * 把识别结果喂给手势引擎，并处理模式切换。
+ * 引擎内部已经做了归一化 + 滞回 + 多帧投票，这里只做"应用动作"。
+ */
+function processGestures(result, dt) {
+  const lm = (result && result.landmarks && result.landmarks[0]) || null;
+  lastLandmarks = lm;
+
+  const ev = gestures.update(lm, dt);
+  lastPose = ev;
+
+  STATE.hand.detected = ev.visible;
+  STATE.hand.x = ev.x;
+  STATE.hand.y = ev.y;
+
+  if (ev.changed) applyMode(ev.mode);
+
+  // 照片特写时，左右滑动 = 上一张 / 下一张
+  if (ev.swipe && STATE.mode === 'FOCUS') {
+    cycleFocus(ev.swipe === 'right' ? 1 : -1);
+  }
+
+  // "再看一次换一张"：捏合一次 → 翻到下一张（一直捏着只算一次）
+  if (ev.pinchStart && STATE.mode === 'FOCUS') {
+    cycleFocus(1);
+  }
+
+  drawPreview(lm, ev);
+  updateHud(ev);
+}
+
+function applyMode(mode) {
+  STATE.mode = mode;
+  STATE.focusTarget = null;
+  // 进入特写就直接翻到"下一张"，所以每捏一次都是新的一张
+  if (mode === 'FOCUS') showPhoto(1);
+  updateHud(lastPose, true);
+  flashHint();
+}
+
+function photoList() {
+  return particleSystem.filter(p => p.type === 'PHOTO');
+}
+
+/** 当前特写照片是第几张（给 UI 显示 3 / 8） */
+function focusInfo() {
+  const list = photoList();
+  if (!list.length || !STATE.focusTarget) return null;
+  let i = STATE.focusIndex;
+  if (!(i >= 0 && i < list.length) || list[i].mesh !== STATE.focusTarget) {
+    i = list.findIndex(p => p.mesh === STATE.focusTarget);
+  }
+  return i < 0 ? null : { index: i, total: list.length };
+}
+
+/** dir = 1 下一张，-1 上一张；按顺序翻页，不再按指尖位置挑 */
+function cycleFocus(dir) {
+  showPhoto(dir);
+}
+
+function showPhoto(dir) {
+  const list = photoList();
+  if (!list.length) return;
+  STATE.focusIndex = ((STATE.focusIndex + dir) % list.length + list.length) % list.length;
+  STATE.focusTarget = list[STATE.focusIndex].mesh;
+  flashHint();
+  updateHud(lastPose, true);
+}
+
+// ============================================================
+//  摄像头预览：镜像画面 + 手部骨架，让"识别到了什么"一眼可见
+// ============================================================
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+// 每根手指的关节在关键点数组里的下标（画不同颜色用）
+const FINGER_JOINTS = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]];
+const FINGER_COLORS = {
+  on: '#7dffb0',
+  off: 'rgba(255,255,255,0.25)'
+};
+
+function drawPreview(lm, ev) {
+  if (!webcamCtx || !webcamCanvas || !video || video.readyState < 2) return;
+  const w = webcamCanvas.width;
+  const h = webcamCanvas.height;
+
+  // 镜像绘制，符合"照镜子"的直觉（同时和手左右移动的控制方向保持一致）
+  webcamCtx.save();
+  webcamCtx.translate(w, 0);
+  webcamCtx.scale(-1, 1);
+  webcamCtx.drawImage(video, 0, 0, w, h);
+  webcamCtx.restore();
+
+  if (!lm) return;
+
+  // 关键点也要镜像：镜像后 x_screen = (1 - x) * w
+  const px = (i) => (1 - lm[i].x) * w;
+  const py = (i) => lm[i].y * h;
+
+  const extended = (ev && ev.extended) || [false,false,false,false,false];
+
+  // 骨骼
+  webcamCtx.lineWidth = 2;
+  for (const [a, b] of HAND_CONNECTIONS) {
+    webcamCtx.strokeStyle = 'rgba(255, 214, 102, 0.55)';
+    webcamCtx.beginPath();
+    webcamCtx.moveTo(px(a), py(a));
+    webcamCtx.lineTo(px(b), py(b));
+    webcamCtx.stroke();
+  }
+
+  // 手指：伸直的绿色，蜷起的灰色
+  FINGER_JOINTS.forEach((joints, fi) => {
+    webcamCtx.strokeStyle = extended[fi] ? FINGER_COLORS.on : FINGER_COLORS.off;
+    webcamCtx.lineWidth = extended[fi] ? 3 : 2;
+    webcamCtx.beginPath();
+    const base = fi === 0 ? 1 : joints[0];
+    webcamCtx.moveTo(px(base), py(base));
+    for (const j of joints) webcamCtx.lineTo(px(j), py(j));
+    webcamCtx.stroke();
+  });
+
+  // 关键点
+  for (let i = 0; i < lm.length; i++) {
+    webcamCtx.fillStyle = i === 4 || i === 8 ? '#fff6d0' : 'rgba(255,255,255,0.8)';
+    webcamCtx.beginPath();
+    webcamCtx.arc(px(i), py(i), i === 4 || i === 8 ? 3 : 1.8, 0, Math.PI * 2);
+    webcamCtx.fill();
+  }
+
+  // 捏合时把拇指尖-食指尖连一条高亮线，明确告诉用户"我抓到你的捏合了"
+  if (ev && ev.label === 'FOCUS') {
+    webcamCtx.strokeStyle = '#ff5b7f';
+    webcamCtx.lineWidth = 3;
+    webcamCtx.beginPath();
+    webcamCtx.moveTo(px(4), py(4));
+    webcamCtx.lineTo(px(8), py(8));
+    webcamCtx.stroke();
+  }
+}
+
+// ============================================================
+//  状态提示 UI
+// ============================================================
+const ui = {};
+function cacheUi() {
+  ui.hint = document.getElementById('gesture-hint');
+  ui.mode = document.getElementById('gh-mode');
+  ui.dot = document.getElementById('gh-dot');
+  ui.webcamWrap = document.getElementById('webcam-wrapper');
+  ui.debug = document.getElementById('gesture-debug');
+  ui.dbgLabel = document.getElementById('dbg-label');
+  ui.dbgConf = document.getElementById('dbg-conf');
+  ui.dbgPinch = document.getElementById('dbg-pinch');
+  ui.dbgSpread = document.getElementById('dbg-spread');
+  ui.dbgCurl = document.getElementById('dbg-curl');
+  ui.dbgVotes = document.getElementById('dbg-votes');
+  ui.dbgFingers = document.getElementById('dbg-fingers');
+  if (ui.dbgFingers && !ui.dbgFingers.childElementCount) {
+    for (const def of FINGER_DEFS) {
+      const dot = document.createElement('span');
+      dot.className = 'finger-dot';
+      dot.dataset.key = def.key;
+      dot.title = def.label;
+      dot.textContent = def.label[0];
+      ui.dbgFingers.appendChild(dot);
+    }
+  }
+}
+
+const MODE_TEXT = {
+  TREE: '🎄 圣诞树',
+  SCATTER: '✨ 散开',
+  FOCUS: '🖼 照片特写',
+  IDLE: '待机',
+  OFF: '手势不可用'
+};
+
+function setHint(mode) {
+  if (!ui.mode) return;
+  ui.mode.textContent = mode === 'OFF'
+    ? '手势识别不可用（需要摄像头权限）'
+    : (MODE_TEXT[mode] || MODE_TEXT.IDLE);
+}
+
+let hudAt = 0;
+function updateHud(ev, force = false) {
+  if (!ev) return;
+  const now = performance.now();
+  if (!force && now - hudAt < 100) return;
+  hudAt = now;
+
+  if (ui.webcamWrap) ui.webcamWrap.classList.toggle('active', !!ev.visible);
+  if (ui.dot) ui.dot.classList.toggle('on', !!ev.visible);
+
+  // 顶部/底部主提示：只有"识别到手"时才覆盖为手势名，避免一闪一闪
+  if (ui.mode) {
+    if (ev.visible) {
+      const info = ev.mode === 'FOCUS' ? focusInfo() : null;
+      ui.mode.textContent = info
+        ? `🖼 照片 ${info.index + 1} / ${info.total} · 再捏一次看下一张`
+        : (MODE_TEXT[ev.mode] || MODE_TEXT.IDLE);
+      ui.mode.dataset.state = ev.label;
+    } else {
+      ui.mode.textContent = '把手举到摄像头前…';
+      ui.mode.dataset.state = 'NONE';
+    }
+  }
+
+  if (!ui.debug || !ui.debug.classList.contains('visible')) return;
+
+  const m = ev.metrics;
+  if (ui.dbgLabel) ui.dbgLabel.textContent = ev.label;
+  if (ui.dbgConf) ui.dbgConf.textContent = (ev.confidence * 100).toFixed(0) + '%';
+  if (m) {
+    if (ui.dbgPinch) ui.dbgPinch.textContent = m.pinch.toFixed(2);
+    if (ui.dbgSpread) ui.dbgSpread.textContent = m.spread.toFixed(2);
+    if (ui.dbgCurl) ui.dbgCurl.textContent = m.indexCurl.toFixed(2);
+  }
+  if (ui.dbgVotes) {
+    ui.dbgVotes.textContent = gestures.votes.length ? gestures.votes.join(' ') : '—';
+  }
+  if (ui.dbgFingers) {
+    const dots = ui.dbgFingers.children;
+    for (let i = 0; i < dots.length; i++) {
+      dots[i].classList.toggle('on', !!ev.extended[i]);
+    }
+  }
+}
+
+function flashHint() {
+  if (!ui.hint) return;
+  ui.hint.classList.remove('flash');
+  // 触发重排，让动画可以重放
+  void ui.hint.offsetWidth;
+  ui.hint.classList.add('flash');
+}
+
+function setupEvents() {
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+  });
+  const input = document.getElementById('file-input');
+  if (input) input.addEventListener('change', handleImageUpload);
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'h') {
+      const controls = document.querySelector('.upload-wrapper');
+      if (controls) controls.classList.toggle('ui-hidden');
+    } else if (k === 'g' && ui.debug) {
+      ui.debug.classList.toggle('visible');
+    }
+  });
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  updateSceneRotation(dt);
+  for (const p of particleSystem) p.update(dt, STATE.mode, STATE.focusTarget);
+  composer.render();
+}
+
+/**
+ * 场景旋转：
+ *  - SCATTER：手掌横向位置直接映射到 ±180°，整圈都能转到；纵向控制俯仰
+ *  - TREE / FOCUS：缓慢自转，俯仰回正
+ * 手放在画面中间只有 3% 死区，几乎一动手就有反馈。
+ */
+function updateSceneRotation(dt) {
+  const rot = gestures.cfg.smooth;
+  if (STATE.mode === 'SCATTER' && STATE.hand.detected) {
+    // 纯函数：手掌位置 → 朝向，单级平滑 16/s（约 60ms 跟手）
+    const next = followRotation(STATE.rotation, { x: gestures.x, y: gestures.y }, rot, dt);
+    STATE.rotation.y = next.y;
+    STATE.rotation.x = next.x;
+  } else if (STATE.mode === 'TREE') {
+    STATE.rotation.y += 0.3 * dt;
+    STATE.rotation.x += (0 - STATE.rotation.x) * (1 - Math.exp(-2.0 * dt));
+  } else {
+    STATE.rotation.y += 0.1 * dt;
+    STATE.rotation.x += (0 - STATE.rotation.x) * (1 - Math.exp(-2.0 * dt));
+  }
+  mainGroup.rotation.y = STATE.rotation.y;
+  mainGroup.rotation.x = STATE.rotation.x;
+}
+
+init();

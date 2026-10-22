@@ -1,0 +1,25 @@
+# 不要提交依赖与构建产物
+node_modules/
+assets/lib/node_modules/
+
+# 备份 / 临时文件
+assets/bundle.backup.js
+*.bak
+*.tmp
+build/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Python（本地静态服务器）
+__pycache__/
+*.pyc
+
+# 截图工具产生的临时文件
+_shots/report.json
+assets/_shots/
+_shots/*_desktop.jpg
