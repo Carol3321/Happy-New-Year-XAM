@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Happy New Year · XAM</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; }
+  body {
+    font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    color: #e8dcc0; display: flex; align-items: center; justify-content: center;
+    text-align: center; overflow: hidden;
+  }
+  .wrap { padding: 0 32px; max-width: 520px; }
+  h1 {
+    font-family: 'Cinzel', 'Times New Roman', serif;
+    font-size: 34px; font-weight: 400; letter-spacing: 6px; margin: 0 0 10px;
+    background: linear-gradient(to bottom, #fff, #eebb66);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .sub { color: rgba(212, 175, 55, 0.55); font-size: 12px; letter-spacing: 3px; margin-bottom: 34px; }
+  .tip {
+    font-size: 15px; line-height: 2; color: rgba(255, 255, 255, 0.72);
+    border: 1px solid rgba(212, 175, 55, 0.25); border-radius: 12px;
+    padding: 22px 20px; background: rgba(255, 255, 255, 0.03);
+  }
+  .tip b { color: #ffd966; }
+  .arrow { font-size: 30px; margin: 18px 0 6px; color: #d4af37; }
+  a.go {
+    display: inline-block; margin-top: 26px; padding: 12px 34px;
+    color: #d4af37; text-decoration: none; font-size: 12px; letter-spacing: 4px;
+    border: 1px solid rgba(212, 175, 55, 0.55); transition: all .3s;
+  }
+  a.go:hover { background: #d4af37; color: #000; }
+  .spin {
+    width: 26px; height: 26px; margin: 0 auto 22px;
+    border: 1px solid rgba(212, 175, 55, 0.2); border-top-color: #d4af37;
+    border-radius: 50%; animation: sp 0.9s linear infinite;
+  }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  #wx { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap" id="loading">
+  <div class="spin"></div>
+  <div class="sub">LOADING</div>
+</div>
+
+<div class="wrap" id="wx">
+  <h1>HAPPY NEW YEAR</h1>
+  <div class="sub">XAM</div>
+  <div class="tip">
+    这个页面要用<b>摄像头</b>识别手势，<br>
+    微信内置浏览器通常拿不到摄像头权限。
+    <div class="arrow">↗</div>
+    请点右上角 <b>「…」→ 在浏览器打开</b>
+  </div>
+  <a class="go" href="christmas-tree-gesture.html">仍然打开</a>
+</div>
+
+<script>
+  (function () {
+    var ua = navigator.userAgent || '';
+    var isWeChat = /MicroMessenger/i.test(ua);
+    // 微信内置浏览器：给一个"在浏览器打开"的提示页，避免看到"手势不可用"以为坏了
+    if (isWeChat) {
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('wx').style.display = 'block';
+      return;
+    }
+    location.replace('christmas-tree-gesture.html');
+  })();
+</script>
+</body>
+</html>
