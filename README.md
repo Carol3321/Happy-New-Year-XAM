@@ -1,4 +1,4 @@
-# Happy New Year · XAM
+# Happy New Year · XAH
 
 一个用**手势控制**的 3D 新年树 —— Three.js + MediaPipe Hands，纯前端、离线可跑。
 

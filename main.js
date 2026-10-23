@@ -71,7 +71,7 @@ function initThree() {
   renderer.toneMappingExposure = 2.2;
   container.appendChild(renderer.domElement);
   mainGroup = new THREE.Group();
-  // 整体下移一点，给顶部标题（Happy New Year / XAM）留出呼吸空间
+  // 整体下移一点，给顶部标题（Happy New Year / XAH）留出呼吸空间
   mainGroup.position.y = -1.2;
   scene.add(mainGroup);
 }
