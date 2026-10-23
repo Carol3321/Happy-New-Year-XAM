@@ -48,16 +48,17 @@ h1 {
  transition: opacity 0.5s ease;
 }
 
-/* 标题下方的大写署名 */
+/* 标题下方的署名 */
 .signature {
- margin-top: 8px;
- font-family: 'Cinzel', 'Times New Roman', serif;
- font-size: clamp(22px, 4.8vw, 40px);
- font-weight: 700;
+ margin-top: 10px;
+ font-family: 'Times New Roman', Georgia, 'Songti SC', serif;
+ font-size: clamp(20px, 4vw, 34px);
+ font-weight: 600;
+ font-style: italic;
  line-height: 1.1;
- letter-spacing: 0.28em;
- text-indent: 0.28em;      /* 抵消末字的字距，保证视觉居中 */
- text-transform: uppercase;
+ letter-spacing: 0.12em;
+ text-indent: 0.12em;      /* 抵消末字的字距，保证视觉居中 */
+ white-space: nowrap;
  background: linear-gradient(to bottom, #fff6d5, #d4af37 55%, #a97e12);
  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
  filter: drop-shadow(0 0 28px rgba(255, 217, 102, 0.45));
@@ -332,7 +333,7 @@ h1 {
 
 <div id="ui-layer">
  <h1>Happy New Year</h1>
- <div class="signature">XAH</div>
+ <div class="signature">X And H</div>
 
  <div class="upload-wrapper">
  <label class="upload-btn">
