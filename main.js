@@ -70,6 +70,7 @@ function initThree() {
   scene.fog = new THREE.FogExp2(CONFIG.colors.bg, 0.01);
   camera = new THREE.PerspectiveCamera(42, window.innerWidth / window.innerHeight, 0.1, 1000);
   camera.position.set(0, 2, CONFIG.camera.z);
+  updateViewMetrics();
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -200,7 +201,7 @@ class Particle {
     if (mode === 'SCATTER') target = this.posScatter;
     else if (mode === 'FOCUS') {
       if (this.mesh === focusTargetMesh) {
-        const desiredWorldPos = new THREE.Vector3(0, 2, 35);
+        const desiredWorldPos = new THREE.Vector3(0, 1.1, 35);
         const invMatrix = new THREE.Matrix4().copy(mainGroup.matrixWorld).invert();
         target = desiredWorldPos.applyMatrix4(invMatrix);
       } else { target = this.posScatter; }
@@ -228,11 +229,31 @@ class Particle {
     } else if (mode === 'SCATTER' && this.type === 'PHOTO') {
       s = this.baseScale * 2.5;
     } else if (mode === 'FOCUS') {
-      if (isFocusTarget) s = 4.5;
+      if (isFocusTarget) s = this.focusScaleFor();   // 按视口自适应放大，手机竖屏也不会被裁
       else s = this.baseScale * 0.8;
     }
     this.mesh.scale.lerp(_tmpScale.set(s, s, s), 1 - Math.exp(-4 * dt));
   }
+
+  /** 特写时放多大：占屏幕高度 66%、宽度 88%，两者取小，保证不裁切也不挡标题 */
+  focusScaleFor() {
+    const fw = this.frameW || 1.4;
+    const fh = this.frameH || 1.4;
+    // 每次都按当前相机算，避免横竖屏/窗口尺寸变化后用到旧值
+    const dist = Math.max(camera.position.z - 35, 1);
+    const h = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * dist;
+    const w = h * camera.aspect;
+    return Math.min((h * 0.66) / fh, (w * 0.88) / fw);
+  }
+}
+
+// 特写平面(z=35)附近的可视范围（世界单位），窗口尺寸变化时更新
+const viewMetrics = { w: 18, h: 11.5 };
+function updateViewMetrics() {
+  if (!camera) return;
+  const dist = Math.max(camera.position.z - 35, 1);
+  viewMetrics.h = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * dist;
+  viewMetrics.w = viewMetrics.h * camera.aspect;
 }
 
 function createParticles() {
@@ -331,8 +352,11 @@ function addPhotoToScene(texture, fullUrl = null) {
   group.scale.set(s,s,s);
   photoMeshGroup.add(group);
   const particle = new Particle(group, 'PHOTO', false);
+  particle.frameW = pw + 0.2;         // 相框尺寸，特写时按它算最大可放倍数
+  particle.frameH = ph + 0.2;
   particle.fullUrl = fullUrl;         // 树上用缩略图，大图按需加载
-  particle.fullLoaded = false;
+  particle.thumbTexture = texture;    // 大图被回收时退回这张
+  particle.fullTexture = null;
   particle.orderIndex = 1e6 + (photoSeq++);   // 用户上传的排在内置相册之后
   particleSystem.push(particle);
   return particle;
@@ -405,20 +429,83 @@ function applyDebugPhoto() {
   applyFocusOverlay();
 }
 
-/** 某张照片成为特写时，按需把缩略图换成原图 */
+/**
+ * 特写用的大图：按需加载 + 缓存 + 预取相邻张。
+ * 之前是"翻到哪张才去下载"，慢网络下会先看到 320px 缩略图（发糊），
+ * 现在提前把下一张/上一张也拉下来，翻页时基本是秒切原图。
+ */
+const fullCache = [];          // 最近用过的大图（LRU），防止显存无限增长
+const FULL_CACHE_MAX = 8;
+const fullLoader = new THREE.TextureLoader();
+
+function loadFullTexture(p) {
+  if (!p || !p.fullUrl) return Promise.resolve(null);
+  if (p.fullTexture) return Promise.resolve(p.fullTexture);
+  if (p.fullPromise) return p.fullPromise;
+  p.fullPromise = new Promise((resolve) => {
+    fullLoader.load(
+      p.fullUrl,
+      (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        p.fullTexture = tex;
+        p.fullPromise = null;
+        touchFullCache(p);
+        resolve(tex);
+      },
+      undefined,
+      () => { p.fullPromise = null; resolve(null); }
+    );
+  });
+  return p.fullPromise;
+}
+
+function touchFullCache(p) {
+  const i = fullCache.indexOf(p);
+  if (i >= 0) fullCache.splice(i, 1);
+  fullCache.push(p);
+  while (fullCache.length > FULL_CACHE_MAX) {
+    const old = fullCache.shift();
+    if (!old || old === overlayPhotoParticle()) continue;
+    const plane = old.mesh.userData.photoMesh;
+    if (plane && old.fullTexture) {
+      if (plane.material.map === old.fullTexture) {
+        plane.material.map = old.thumbTexture;   // 退回缩略图，释放显存
+        plane.material.needsUpdate = true;
+      }
+      old.fullTexture.dispose();
+      old.fullTexture = null;
+    }
+  }
+}
+
+function overlayPhotoParticle() {
+  return overlayPhotoMesh ? particleSystem.find(x => x.mesh === overlayPhotoMesh) : null;
+}
+
+/** 某张照片成为特写时，换成原图（并顺手预取前后两张） */
 function ensureFullTexture(mesh) {
   if (!mesh) return;
   const p = particleSystem.find(x => x.mesh === mesh);
-  if (!p || !p.fullUrl || p.fullLoaded) return;
-  p.fullLoaded = true;
-  new THREE.TextureLoader().load(p.fullUrl, (tex) => {
-    tex.colorSpace = THREE.SRGBColorSpace;
+  if (!p) return;
+  loadFullTexture(p).then((tex) => {
+    if (!tex) return;
     const plane = p.mesh.userData.photoMesh;
     if (!plane) return;
-    if (plane.material.map && plane.material.map !== tex) plane.material.map.dispose();
-    plane.material.map = tex;
-    plane.material.needsUpdate = true;
+    if (plane.material.map !== tex) {
+      plane.material.map = tex;
+      plane.material.needsUpdate = true;
+    }
   });
+
+  // 预取相邻两张，翻页时不用等
+  const list = photoList();
+  const i = list.findIndex(x => x.mesh === mesh);
+  if (i >= 0) {
+    [list[(i + 1) % list.length], list[(i + 2) % list.length]].forEach((q) => {
+      if (q && q !== p) loadFullTexture(q);
+    });
+  }
 }
 
 function handleImageUpload(e) {
@@ -844,6 +931,7 @@ function setupEvents() {
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
+    updateViewMetrics();
     renderer.setSize(window.innerWidth, window.innerHeight);
     composer.setSize(window.innerWidth, window.innerHeight);
   });
