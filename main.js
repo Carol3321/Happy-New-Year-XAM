@@ -443,10 +443,10 @@ async function initMediaPipe() {
       },
       runningMode: "VIDEO",
       numHands: 1,
-      // 提高三个置信度阈值：宁可漏一帧，也不要把"像手的东西"当成手
-      minHandDetectionConfidence: 0.6,
-      minHandPresenceConfidence: 0.6,
-      minTrackingConfidence: 0.6
+      // 用 MediaPipe 默认阈值（0.5）：更宽容，暗光/手偏一点也能跟住
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5
     });
   } catch (err) {
     console.warn('手部模型加载失败:', err);
@@ -456,11 +456,17 @@ async function initMediaPipe() {
 
 let lastVideoTime = -1;
 let lastDetectAt = 0;
+const DETECT_INTERVAL_MS = 1000 / 30;   // 手部检测限流到 30fps
+// 诊断：真的每秒跑了几次手部检测
+const diag = { detects: 0, fps: 0, handHit: 0, lastTick: 0 };
 async function predictWebcam() {
   requestAnimationFrame(predictWebcam);
   if (!video || video.readyState < 2) return;
   if (video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
+
+  // 视频被浏览器暂停时自动续播（否则画面冻结、检测也停摆）
+  if (video.paused) video.play().catch(() => {});
 
   // 模型还没加载好：先把摄像头画面画出来，让用户知道相机是通的
   if (!handLandmarker) {
@@ -469,10 +475,22 @@ async function predictWebcam() {
   }
 
   const now = performance.now();
+  // 关键：摄像头在 640x480 下可能跑到 60fps，如果每帧都送进 MediaPipe，
+  // 相当于把同一帧喂两遍，跟踪器会算错运动而丢掉手部（表现为“完全没反应”）。
+  // 这里限流到 30fps，正好是一次视频帧一次检测。
+  if (lastDetectAt && now - lastDetectAt < DETECT_INTERVAL_MS) return;
+
   const dt = lastDetectAt ? (now - lastDetectAt) / 1000 : 1 / 30;
   lastDetectAt = now;
 
   const result = handLandmarker.detectForVideo(video, now);
+  diag.detects++;
+  if (result && result.landmarks && result.landmarks.length) diag.handHit++;
+  if (now - diag.lastTick > 1000) {
+    diag.fps = Math.round((diag.detects * 1000) / (now - diag.lastTick));
+    diag.detects = 0;
+    diag.lastTick = now;
+  }
   processGestures(result, dt);
 }
 
@@ -640,6 +658,8 @@ function cacheUi() {
   ui.dbgSpread = document.getElementById('dbg-spread');
   ui.dbgCurl = document.getElementById('dbg-curl');
   ui.dbgVotes = document.getElementById('dbg-votes');
+  ui.dbgDet = document.getElementById('dbg-det');
+  ui.dbgVideo = document.getElementById('dbg-video');
   ui.dbgFingers = document.getElementById('dbg-fingers');
   if (ui.dbgFingers && !ui.dbgFingers.childElementCount) {
     for (const def of FINGER_DEFS) {
@@ -722,6 +742,12 @@ function updateHud(ev, force = false) {
   }
   if (ui.dbgVotes) {
     ui.dbgVotes.textContent = gestures.votes.length ? gestures.votes.join(' ') : '—';
+  }
+  if (ui.dbgDet) ui.dbgDet.textContent = `${diag.fps}/s`;
+  if (ui.dbgVideo && video) {
+    ui.dbgVideo.textContent = video.paused
+      ? '已暂停'
+      : `${video.videoWidth}x${video.videoHeight} ${video.currentTime.toFixed(1)}s`;
   }
   if (ui.dbgFingers) {
     const dots = ui.dbgFingers.children;
