@@ -425,6 +425,7 @@ async function initMediaPipe() {
     video.addEventListener('loadeddata', () => { video.play().catch(() => {}); });
     cameraLive = true;
     if (ui.webcamWrap) ui.webcamWrap.classList.add('active');
+    setHintText('摄像头已就绪 · 正在加载识别模型…', false);
     predictWebcam();
   } catch (err) {
     console.warn('摄像头打开失败:', err);
@@ -667,13 +668,18 @@ function setHint(mode) {
     : (MODE_TEXT[mode] || MODE_TEXT.IDLE);
 }
 
-/** 直接设置提示文字（摄像头 / 模型出错时用），同时把状态标红 */
-function setHintText(text) {
+/** 直接设置提示文字；warn=true 表示错误（红色、且不会被状态刷新覆盖） */
+function setHintText(text, warn = true) {
   if (!ui.mode) return;
   ui.mode.textContent = text;
-  ui.mode.dataset.state = 'ERR';
-  if (ui.hint) ui.hint.classList.add('warn');
-  if (ui.dot) ui.dot.classList.remove('on');
+  if (warn) {
+    ui.mode.dataset.state = 'ERR';
+    if (ui.hint) ui.hint.classList.add('warn');
+    if (ui.dot) ui.dot.classList.remove('on');
+  } else {
+    ui.mode.dataset.state = '';
+    if (ui.hint) ui.hint.classList.remove('warn');
+  }
 }
 
 let hudAt = 0;
