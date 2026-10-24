@@ -9,7 +9,7 @@ import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 import { GestureEngine, followRotation, FINGER_DEFS } from './gesture-engine.mjs';
 
 const CONFIG = {
-  colors: { bg: 0x000000, champagneGold: 0xffd966, deepGreen: 0x03180a, accentRed: 0x990000 },
+  colors: { bg: 0x000000, champagneGold: 0xffd966, deepGreen: 0x0d5c2a, accentRed: 0xd21a1a },
   particles: { count: 1500, dustCount: 2500, treeHeight: 24, treeRadius: 8 },
   camera: { z: 50 }
 };
@@ -75,7 +75,7 @@ function initThree() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.toneMapping = THREE.ReinhardToneMapping;
-  renderer.toneMappingExposure = 1.6;
+  renderer.toneMappingExposure = 1.9;
   container.appendChild(renderer.domElement);
   mainGroup = new THREE.Group();
   // 整体下移一点，给顶部标题（Happy New Year / X And H）留出呼吸空间
@@ -110,8 +110,8 @@ function setupLights() {
 function setupPostProcessing() {
   const renderScene = new RenderPass(scene, camera);
   const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
-  bloomPass.threshold = 0.75;
-  bloomPass.strength = 0.30;
+  bloomPass.threshold = 0.65;
+  bloomPass.strength = 0.40;
   bloomPass.radius = 0.4;
   if (/[?&]nobloom/.test(location.search)) bloomPass.strength = 0;   // 调试：关掉泛光
   const q = new URLSearchParams(location.search);
@@ -242,16 +242,16 @@ function createParticles() {
   ]);
   const candyGeo = new THREE.TubeGeometry(curve, 16, 0.08, 8, false);
   const goldMat = new THREE.MeshStandardMaterial({
-    color: CONFIG.colors.champagneGold, metalness: 1.0, roughness: 0.1,
-    envMapIntensity: 2.0, emissive: 0x443300, emissiveIntensity: 0.3
+    color: CONFIG.colors.champagneGold, metalness: 0.95, roughness: 0.12,
+    envMapIntensity: 2.0, emissive: 0x9a5c00, emissiveIntensity: 0.55
   });
   const greenMat = new THREE.MeshStandardMaterial({
-    color: CONFIG.colors.deepGreen, metalness: 0.2, roughness: 0.8,
-    emissive: 0x002200, emissiveIntensity: 0.2
+    color: CONFIG.colors.deepGreen, metalness: 0.15, roughness: 0.7,
+    emissive: 0x0a5a26, emissiveIntensity: 0.45
   });
   const redMat = new THREE.MeshPhysicalMaterial({
     color: CONFIG.colors.accentRed, metalness: 0.3, roughness: 0.2, clearcoat: 1.0,
-    emissive: 0x330000
+    emissive: 0x8a0a0a, emissiveIntensity: 0.7
   });
   const candyMat = new THREE.MeshStandardMaterial({ map: caneTexture, roughness: 0.4 });
   for (let i = 0; i < CONFIG.particles.count; i++) {
@@ -377,10 +377,20 @@ async function loadGallery() {
       Array.from({ length: Math.min(8, photos.length) }, worker)
     );
     console.log(`相册：已加载 ${ok}/${photos.length} 张`);
+    applyDebugMode();
     applyDebugPhoto();
   } catch (err) {
     console.warn('相册清单读取失败:', err);
   }
+}
+
+/** 调试用：?mode=scatter 直接切到散开状态 */
+function applyDebugMode() {
+  const m = /[?&]mode=(tree|scatter)/i.exec(location.search);
+  if (!m) return;
+  STATE.mode = m[1].toUpperCase();
+  STATE.focusTarget = null;
+  applyFocusOverlay();
 }
 
 /** 调试用：?photo=35 直接把第 35 张放进特写，方便检查画质 */

@@ -20,8 +20,9 @@ export const FINGER_DEFS = [
 ];
 
 export const DEFAULT_CONFIG = {
-  // 捏合：|拇指尖4 - 食指尖8| / 掌心
-  pinch:  { enter: 0.32, exit: 0.46, indexReach: 1.12, indexCurl: 0.68 },
+  // 捏合：|拇指尖4 - 食指尖8| / 掌心。阈值放宽，指尖没完全贴上也能触发；
+  // indexReach 仍要求食指是伸出去的（攥拳时约 1.05），避免握拳被当成捏合
+  pinch:  { enter: 0.42, exit: 0.58, indexReach: 1.20, indexCurl: 0.60 },
   // 张开：食指~小指至少 4 根伸直，且掌心张开度大于阈值
   open:   { minExtended: 4, spreadEnter: 1.02, spreadExit: 0.94 },
   // 握拳：伸直数 <= 1 + 张开度小 + 指尖都收在掌心附近（防止"放松的手"被误判成握拳）
@@ -67,8 +68,9 @@ export function computeMetrics(lm, cfg = DEFAULT_CONFIG) {
     };
   });
 
-  // 拇指尖 ↔ 食指尖（掌心单位）= 捏合程度
-  const pinch = dist3(lm[4], lm[8]) / palm;
+  // 拇指尖 ↔ 食指尖（掌心单位）= 捏合程度。
+  // 这里几乎只用画面 2D 距离：z 的噪声会把手“斜着伸过来”的捏合算远，导致不灵敏。
+  const pinch = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y, (lm[4].z - lm[8].z) * 0.25) / palm;
 
   // 掌心张开度：四指指尖到掌心的平均距离（掌心单位）
   const palmCenter = { x: cx, y: cy, z: cz };
