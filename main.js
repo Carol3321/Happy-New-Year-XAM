@@ -377,11 +377,62 @@ function handleImageUpload(e) {
 // ============================================================
 //  MediaPipe：识别手部 21 个关键点
 // ============================================================
+let cameraLive = false;   // 摄像头流是否已拿到
+
+/** 把 getUserMedia 的报错翻译成人话 */
+function cameraErrorText(err) {
+  const name = err && err.name ? err.name : 'UnknownError';
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return '⚠ 摄像头被浏览器阻止了：点地址栏右侧的相机图标 → 改为「允许」→ 刷新';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return '⚠ 没找到摄像头设备，检查是否被禁用或断开';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return '⚠ 摄像头被其它程序占用（微信/会议软件），关掉再刷新';
+  }
+  if (name === 'OverconstrainedError') {
+    return '⚠ 摄像头不支持请求的参数，已尝试降级，请刷新重试';
+  }
+  return '⚠ 摄像头打开失败：' + name;
+}
+
 async function initMediaPipe() {
   video = document.getElementById('webcam');
   webcamCanvas = document.getElementById('webcam-preview');
   webcamCtx = webcamCanvas ? webcamCanvas.getContext('2d') : null;
   if (webcamCanvas) { webcamCanvas.width = 192; webcamCanvas.height = 144; }
+
+  // 1) 先做环境检查：file:// 或 http 非 localhost 时浏览器根本不给摄像头，
+  //    以前这里会静默跳过，用户只看到“把手举到摄像头前…”以为程序坏了
+  if (!window.isSecureContext) {
+    setHintText(`⚠ 当前是 ${location.protocol}// 打开，浏览器不允许用摄像头。请用 http://localhost 或 https 链接`);
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setHintText('⚠ 这个浏览器不支持摄像头接口，换 Chrome / Edge / Safari 试试');
+    return;
+  }
+
+  // 2) 先要摄像头，让授权弹窗尽早出现
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: { ideal: 'user' } },
+      audio: false
+    });
+    video.srcObject = stream;
+    video.muted = true;
+    video.addEventListener('loadeddata', () => { video.play().catch(() => {}); });
+    cameraLive = true;
+    if (ui.webcamWrap) ui.webcamWrap.classList.add('active');
+    predictWebcam();
+  } catch (err) {
+    console.warn('摄像头打开失败:', err);
+    setHintText(cameraErrorText(err));
+    return;
+  }
+
+  // 3) 再加载手部模型（失败也不影响看摄像头画面）
   try {
     const vision = await FilesetResolver.forVisionTasks("assets/wasm");
     handLandmarker = await HandLandmarker.createFromOptions(vision, {
@@ -396,21 +447,9 @@ async function initMediaPipe() {
       minHandPresenceConfidence: 0.6,
       minTrackingConfidence: 0.6
     });
-    if (navigator.mediaDevices?.getUserMedia) {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480, facingMode: 'user' },
-        audio: false
-      });
-      video.srcObject = stream;
-      video.muted = true;
-      video.addEventListener("loadeddata", () => {
-        video.play().catch(() => {});
-        predictWebcam();
-      });
-    }
   } catch (err) {
-    console.warn('MediaPipe / camera init failed:', err);
-    setHint('OFF');
+    console.warn('手部模型加载失败:', err);
+    setHintText('⚠ 手部模型加载失败，摄像头正常但没有手势识别');
   }
 }
 
@@ -421,7 +460,12 @@ async function predictWebcam() {
   if (!video || video.readyState < 2) return;
   if (video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
-  if (!handLandmarker) return;
+
+  // 模型还没加载好：先把摄像头画面画出来，让用户知道相机是通的
+  if (!handLandmarker) {
+    drawPreview(null, null);
+    return;
+  }
 
   const now = performance.now();
   const dt = lastDetectAt ? (now - lastDetectAt) / 1000 : 1 / 30;
@@ -623,6 +667,15 @@ function setHint(mode) {
     : (MODE_TEXT[mode] || MODE_TEXT.IDLE);
 }
 
+/** 直接设置提示文字（摄像头 / 模型出错时用），同时把状态标红 */
+function setHintText(text) {
+  if (!ui.mode) return;
+  ui.mode.textContent = text;
+  ui.mode.dataset.state = 'ERR';
+  if (ui.hint) ui.hint.classList.add('warn');
+  if (ui.dot) ui.dot.classList.remove('on');
+}
+
 let hudAt = 0;
 function updateHud(ev, force = false) {
   if (!ev) return;
@@ -630,11 +683,13 @@ function updateHud(ev, force = false) {
   if (!force && now - hudAt < 100) return;
   hudAt = now;
 
-  if (ui.webcamWrap) ui.webcamWrap.classList.toggle('active', !!ev.visible);
+  // 只要摄像头通了就显示预览，不再等"识别到手"才出现
+  if (ui.webcamWrap) ui.webcamWrap.classList.toggle('active', cameraLive);
   if (ui.dot) ui.dot.classList.toggle('on', !!ev.visible);
 
   // 顶部/底部主提示：只有"识别到手"时才覆盖为手势名，避免一闪一闪
   if (ui.mode) {
+    if (ui.mode.dataset.state === 'ERR') return;   // 出错信息不要被状态刷掉
     if (ev.visible) {
       const info = ev.mode === 'FOCUS' ? focusInfo() : null;
       ui.mode.textContent = info
@@ -642,7 +697,9 @@ function updateHud(ev, force = false) {
         : (MODE_TEXT[ev.mode] || MODE_TEXT.IDLE);
       ui.mode.dataset.state = ev.label;
     } else {
-      ui.mode.textContent = '把手举到摄像头前…';
+      ui.mode.textContent = cameraLive
+        ? '摄像头已就绪 · 把手举到画面里'
+        : '把手举到摄像头前…';
       ui.mode.dataset.state = 'NONE';
     }
   }

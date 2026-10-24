@@ -100,6 +100,18 @@ h1 {
 
 #file-input { display: none; }
 
+/* 摄像头/模型出错时：提示条变红并可换行，避免长文案溢出屏幕 */
+#gesture-hint.warn {
+ border-color: rgba(255, 130, 130, 0.55);
+ background: rgba(40, 8, 8, 0.78);
+ white-space: normal;
+ max-width: min(760px, calc(100vw - 32px));
+ box-sizing: border-box;
+ text-align: center; line-height: 1.65;
+}
+#gesture-hint.warn #gh-mode { color: #ffc4c4; }
+#gesture-hint.warn #gh-tip { display: none; }
+
 #webcam-wrapper {
  position: absolute; bottom: 76px; right: 40px;
  z-index: 20;
