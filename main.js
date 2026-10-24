@@ -660,12 +660,8 @@ function processGestures(result, dt) {
 
   if (ev.changed) applyMode(ev.mode);
 
-  // 照片特写时，左右滑动 = 上一张 / 下一张
-  if (ev.swipe && STATE.mode === 'FOCUS') {
-    cycleFocus(ev.swipe === 'right' ? 1 : -1);
-  }
-
   // "再看一次换一张"：捏合一次 → 翻到下一张（一直捏着只算一次）
+  // 注意：不再用左右滑动翻页——捏着拍照时手稍微一移动就会误判成滑动，导致连翻好几张
   if (ev.pinchStart && STATE.mode === 'FOCUS') {
     cycleFocus(1);
   }

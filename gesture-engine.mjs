@@ -22,7 +22,12 @@ export const FINGER_DEFS = [
 export const DEFAULT_CONFIG = {
   // 捏合：|拇指尖4 - 食指尖8| / 掌心。阈值放宽，指尖没完全贴上也能触发；
   // indexReach 仍要求食指是伸出去的（攥拳时约 1.05），避免握拳被当成捏合
-  pinch:  { enter: 0.42, exit: 0.58, indexReach: 1.20, indexCurl: 0.60 },
+  pinch:  {
+    enter: 0.48, exit: 0.66, indexReach: 1.12, indexCurl: 0.60,
+    pulseCooldown: 0.45,      // 两次"翻页"之间至少隔这么久
+    rearmDistance: 0.85,      // 必须张开到这种程度才算松手，避免临界抖动被算成多次
+    rearmTime: 0.22,          // 并且要保持这么久
+  },
   // 张开：食指~小指至少 4 根伸直，且掌心张开度大于阈值
   open:   { minExtended: 4, spreadEnter: 1.02, spreadExit: 0.94 },
   // 握拳：伸直数 <= 1 + 张开度小 + 指尖都收在掌心附近（防止"放松的手"被误判成握拳）
@@ -136,7 +141,7 @@ export class GestureEngine {
     // 捏合"脉冲"：每次重新捏合只报一次，用于"看一次换一张"
     this._pinchOn = false;
     this._pinchSeen = 0;
-    this._releaseSeen = 0;
+    this._releaseSince = 0;         // 开始"真正张开"的时间点
     this._lastPinch = -Infinity;
   }
 
@@ -228,26 +233,32 @@ export class GestureEngine {
   }
 
   /**
-   * 捏合上升沿：一直捏着只算一次，必须松开再捏才会再次触发。
-   * 这样"看一次换一张"才能一次动作翻一页，而不是一直捏着就疯狂翻。
+   * 捏合上升沿：一次捏合只报一次。
+   * 关键是要“真正张开手”才算松开（见 pinch.rearmDistance / rearmTime）：
+   * 之前只要 2 帧不在 FOCUS 就允许下一次，手指在临界点一松一紧会被算成好几下，
+   * 表现就是“捏一次翻好多张”。
    */
   _updatePinchPulse() {
+    const c = this.cfg.pinch;
     const isPinch = this.label === 'FOCUS';
     if (isPinch) {
       this._pinchSeen++;
-      this._releaseSeen = 0;
-      // 连续 2 帧确认，且距离上一次捏合超过 0.45 秒
-      if (!this._pinchOn && this._pinchSeen >= 2 && this.time - this._lastPinch >= 0.45) {
+      this._releaseSince = 0;
+      // 连续 2 帧确认，且距离上一次捏合超过冷却时间
+      if (!this._pinchOn && this._pinchSeen >= 2 && this.time - this._lastPinch >= c.pulseCooldown) {
         this._pinchOn = true;
         this._lastPinch = this.time;
         return true;
       }
       return false;
     }
-    this._releaseSeen++;
+
     this._pinchSeen = 0;
-    // 连续 2 帧没捏住才认为松开，避免手抖把一次捏合拆成两次
-    if (this._pinchOn && this._releaseSeen >= 2) this._pinchOn = false;
+    // 只有拇指和食指确实分得够开（远大于退出阈值），并保持一小会儿，才算松开
+    const far = this.metrics && this.metrics.pinch > c.rearmDistance;
+    if (!far) { this._releaseSince = 0; return false; }
+    if (!this._releaseSince) this._releaseSince = this.time;
+    if (this._pinchOn && this.time - this._releaseSince >= c.rearmTime) this._pinchOn = false;
     return false;
   }
 
