@@ -44,10 +44,16 @@ async function init() {
   setupPostProcessing();
   setupEvents();
   cacheUi();
-  await Promise.race([
-    initMediaPipe(),
-    new Promise(resolve => setTimeout(resolve, 8000))
-  ]).catch(err => console.warn('MediaPipe init skipped:', err));
+  await Promise.all([
+    Promise.race([
+      initMediaPipe(),
+      new Promise(resolve => setTimeout(resolve, 8000))
+    ]).catch(err => console.warn('MediaPipe init skipped:', err)),
+    Promise.race([
+      loadGallery(),
+      new Promise(resolve => setTimeout(resolve, 6000))
+    ])
+  ]);
 
   const loader = document.getElementById('loader');
   if (loader) {
@@ -277,7 +283,7 @@ function createDefaultPhotos() {
   addPhotoToScene(tex);
 }
 
-function addPhotoToScene(texture) {
+function addPhotoToScene(texture, fullUrl = null) {
   const frameGeo = new THREE.BoxGeometry(1.4, 1.4, 0.05);
   const frameMat = new THREE.MeshStandardMaterial({ color: CONFIG.colors.champagneGold, metalness: 1.0, roughness: 0.1 });
   const frame = new THREE.Mesh(frameGeo, frameMat);
@@ -288,10 +294,61 @@ function addPhotoToScene(texture) {
   const group = new THREE.Group();
   group.add(frame);
   group.add(photo);
+  group.userData.photoMesh = photo;   // 点开大图时要换 texture
   const s = 0.8;
   group.scale.set(s,s,s);
   photoMeshGroup.add(group);
-  particleSystem.push(new Particle(group, 'PHOTO', false));
+  const particle = new Particle(group, 'PHOTO', false);
+  particle.fullUrl = fullUrl;         // 树上用缩略图，大图按需加载
+  particle.fullLoaded = false;
+  particleSystem.push(particle);
+  return particle;
+}
+
+/**
+ * 相册：assets/photos/manifest.json 里列着每张图的大图和缩略图路径。
+ * 树上只加载 320px 缩略图（55 张总共约 17MB 显存），
+ * 真正点开某一张时才去取 1600px 原图，避免手机显存爆掉。
+ */
+async function loadGallery() {
+  try {
+    const res = await fetch('assets/photos/manifest.json', { cache: 'no-cache' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const photos = (data && data.photos) || [];
+    const loader = new THREE.TextureLoader();
+    let ok = 0;
+    for (const item of photos) {
+      try {
+        const tex = await loader.loadAsync(`assets/photos/${item.thumb}`);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        addPhotoToScene(tex, `assets/photos/${item.full}`);
+        ok++;
+      } catch (e) {
+        console.warn('照片加载失败:', item.thumb, e);
+      }
+    }
+    console.log(`相册：已加载 ${ok}/${photos.length} 张`);
+  } catch (err) {
+    console.warn('相册清单读取失败:', err);
+  }
+}
+
+/** 某张照片成为特写时，按需把缩略图换成原图 */
+function ensureFullTexture(mesh) {
+  if (!mesh) return;
+  const p = particleSystem.find(x => x.mesh === mesh);
+  if (!p || !p.fullUrl || p.fullLoaded) return;
+  p.fullLoaded = true;
+  new THREE.TextureLoader().load(p.fullUrl, (tex) => {
+    tex.colorSpace = THREE.SRGBColorSpace;
+    const plane = p.mesh.userData.photoMesh;
+    if (!plane) return;
+    if (plane.material.map && plane.material.map !== tex) plane.material.map.dispose();
+    plane.material.map = tex;
+    plane.material.needsUpdate = true;
+  });
 }
 
 function handleImageUpload(e) {
@@ -431,6 +488,7 @@ function showPhoto(dir) {
   if (!list.length) return;
   STATE.focusIndex = ((STATE.focusIndex + dir) % list.length + list.length) % list.length;
   STATE.focusTarget = list[STATE.focusIndex].mesh;
+  ensureFullTexture(STATE.focusTarget);
   flashHint();
   updateHud(lastPose, true);
 }

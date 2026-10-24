@@ -435,39 +435,6 @@ h1 {
 
 <script type="module" src="assets/bundle.js"></script>
 <script>
-// 页面加载后自动把预设照片挂到树上
-window.addEventListener('load', async () => {
-  await new Promise(r => setTimeout(r, 1500)); // 等 three.js 初始化
-  
-  const photoUrls = [
-    'assets/photos/photo1.jpg',
-    'assets/photos/photo2.jpg',
-    'assets/photos/photo3.jpg',
-    'assets/photos/photo4.jpg',
-    'assets/photos/photo5.jpg',
-    'assets/photos/photo6.jpg',
-    'assets/photos/photo7.jpg',
-    'assets/photos/photo8.jpg'
-  ];
-  
-  const input = document.getElementById('file-input');
-  if (!input) return;
-  
-  const dt = new DataTransfer();
-  for (const url of photoUrls) {
-    try {
-      const res = await fetch(url);
-      const blob = await res.blob();
-      const file = new File([blob], url.split('/').pop(), { type: 'image/jpeg' });
-      dt.items.add(file);
-    } catch (e) { console.warn('load photo failed:', url, e); }
-  }
-  
-  input.files = dt.files;
-  input.dispatchEvent(new Event('change', { bubbles: true }));
-});
-</script>
-<script>
 // ---------------- 手势教程 ----------------
 (() => {
   const TUT_KEY = 'xmas-gesture-tutorial-v1';
