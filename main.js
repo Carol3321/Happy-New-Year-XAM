@@ -318,17 +318,25 @@ async function loadGallery() {
     const photos = (data && data.photos) || [];
     const loader = new THREE.TextureLoader();
     let ok = 0;
-    for (const item of photos) {
-      try {
-        const tex = await loader.loadAsync(`assets/photos/${item.thumb}`);
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-        addPhotoToScene(tex, `assets/photos/${item.full}`);
-        ok++;
-      } catch (e) {
-        console.warn('照片加载失败:', item.thumb, e);
+    let cursor = 0;
+    // 并发 8 路：55 张串行加载在手机上要等半分钟，并发后几秒就铺满
+    const worker = async () => {
+      while (cursor < photos.length) {
+        const item = photos[cursor++];
+        try {
+          const tex = await loader.loadAsync(`assets/photos/${item.thumb}`);
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+          addPhotoToScene(tex, `assets/photos/${item.full}`);
+          ok++;
+        } catch (e) {
+          console.warn('照片加载失败:', item.thumb, e);
+        }
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(8, photos.length) }, worker)
+    );
     console.log(`相册：已加载 ${ok}/${photos.length} 张`);
   } catch (err) {
     console.warn('相册清单读取失败:', err);
