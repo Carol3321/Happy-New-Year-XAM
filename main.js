@@ -389,6 +389,7 @@ async function loadGallery() {
           const p = addPhotoToScene(tex, `assets/photos/${item.full}`);
           p.orderIndex = order;      // 并发加载会乱序，记下相册里的原始位置
           p.photoId = item.id;
+          p.midUrl = item.mid ? `assets/photos/${item.mid}` : null;
           ok++;
         } catch (e) {
           console.warn('照片加载失败:', item.thumb, e);
@@ -483,28 +484,68 @@ function overlayPhotoParticle() {
   return overlayPhotoMesh ? particleSystem.find(x => x.mesh === overlayPhotoMesh) : null;
 }
 
-/** 某张照片成为特写时，换成原图（并顺手预取前后两张） */
+/** 先把 720px 的中间版本贴上（几十 KB，秒到），避免只看到 384px 缩略图 */
+function loadMidTexture(p) {
+  if (!p || !p.midUrl) return Promise.resolve(null);
+  if (p.midTexture) return Promise.resolve(p.midTexture);
+  if (p.midPromise) return p.midPromise;
+  p.midPromise = new Promise((resolve) => {
+    fullLoader.load(
+      p.midUrl,
+      (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        p.midTexture = tex;
+        p.midPromise = null;
+        resolve(tex);
+      },
+      undefined,
+      () => { p.midPromise = null; resolve(null); }
+    );
+  });
+  return p.midPromise;
+}
+
+function applyTextureToParticle(p, tex) {
+  if (!p || !tex) return;
+  const plane = p.mesh.userData.photoMesh;
+  if (!plane) return;
+  if (plane.material.map === tex) return;
+  plane.material.map = tex;
+  plane.material.needsUpdate = true;
+}
+
+/** 某张照片成为特写时：先上 720px，再换 1800px（并预取后面几张） */
 function ensureFullTexture(mesh) {
   if (!mesh) return;
   const p = particleSystem.find(x => x.mesh === mesh);
   if (!p) return;
-  loadFullTexture(p).then((tex) => {
-    if (!tex) return;
-    const plane = p.mesh.userData.photoMesh;
-    if (!plane) return;
-    if (plane.material.map !== tex) {
-      plane.material.map = tex;
-      plane.material.needsUpdate = true;
-    }
-  });
 
-  // 预取相邻两张，翻页时不用等
+  if (p.fullTexture) {
+    applyTextureToParticle(p, p.fullTexture);
+  } else {
+    // 中间版本先顶上
+    loadMidTexture(p).then((mid) => {
+      if (mid && !p.fullTexture) applyTextureToParticle(p, mid);
+    });
+    loadFullTexture(p).then((tex) => {
+      if (!tex) return;
+      applyTextureToParticle(p, tex);
+      // 大图到位后释放中间版本，省显存
+      if (p.midTexture) { p.midTexture.dispose(); p.midTexture = null; }
+    });
+  }
+
+  // 预取：后面两张的大图 + 四张的中间版本
   const list = photoList();
   const i = list.findIndex(x => x.mesh === mesh);
   if (i >= 0) {
-    [list[(i + 1) % list.length], list[(i + 2) % list.length]].forEach((q) => {
-      if (q && q !== p) loadFullTexture(q);
-    });
+    for (let k = 1; k <= 4; k++) {
+      const q = list[(i + k) % list.length];
+      if (!q || q === p) continue;
+      loadMidTexture(q);
+      if (k <= 2) loadFullTexture(q);
+    }
   }
 }
 
@@ -714,7 +755,16 @@ function cycleFocus(dir) {
 function showPhoto(dir) {
   const list = photoList();
   if (!list.length) return;
-  STATE.focusIndex = ((STATE.focusIndex + dir) % list.length + list.length) % list.length;
+  focusAtIndex(STATE.focusIndex + dir);
+}
+
+/** 直接跳到第 i 张（会自动取模），方向键 / U 键都走这里 */
+function focusAtIndex(i) {
+  const list = photoList();
+  if (!list.length) return;
+  const n = list.length;
+  STATE.mode = 'FOCUS';
+  STATE.focusIndex = ((i % n) + n) % n;
   STATE.focusTarget = list[STATE.focusIndex].mesh;
   ensureFullTexture(STATE.focusTarget);
   applyFocusOverlay();
@@ -874,11 +924,13 @@ function updateHud(ev, force = false) {
   // 顶部/底部主提示：只有"识别到手"时才覆盖为手势名，避免一闪一闪
   if (ui.mode) {
     if (ui.mode.dataset.state === 'ERR') return;   // 出错信息不要被状态刷掉
-    if (ev.visible) {
-      const info = ev.mode === 'FOCUS' ? focusInfo() : null;
-      ui.mode.textContent = info
-        ? `🖼 照片 ${info.index + 1} / ${info.total} · 再捏一次看下一张`
-        : (MODE_TEXT[ev.mode] || MODE_TEXT.IDLE);
+    const info = STATE.mode === 'FOCUS' ? focusInfo() : null;
+    if (info) {
+      // 用方向键翻照片时也要显示序号（不依赖是否识别到手）
+      ui.mode.textContent = `🖼 照片 ${info.index + 1} / ${info.total} · 捏合或 ↑↓ 翻页`;
+      ui.mode.dataset.state = ev.visible ? ev.label : 'NONE';
+    } else if (ev.visible) {
+      ui.mode.textContent = MODE_TEXT[ev.mode] || MODE_TEXT.IDLE;
       ui.mode.dataset.state = ev.label;
     } else {
       ui.mode.textContent = cameraLive
@@ -940,6 +992,20 @@ function setupEvents() {
       if (controls) controls.classList.toggle('ui-hidden');
     } else if (k === 'g' && ui.debug) {
       ui.debug.classList.toggle('visible');
+    } else if (k === 'arrowdown' || k === 'arrowup') {
+      // 方向键翻照片：手累了可以不用手势
+      e.preventDefault();
+      const list = photoList();
+      if (!list.length) return;
+      if (STATE.mode !== 'FOCUS') {
+        focusAtIndex(k === 'arrowdown' ? 0 : list.length - 1);
+      } else {
+        focusAtIndex(STATE.focusIndex + (k === 'arrowdown' ? 1 : -1));
+      }
+    } else if (k === 'u') {
+      // U 直接回到第一张
+      e.preventDefault();
+      focusAtIndex(0);
     }
   });
 }
