@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 import { GestureEngine, followRotation, FINGER_DEFS } from './gesture-engine.mjs';
@@ -40,7 +41,7 @@ async function init() {
   createTextures();
   createParticles();
   createDust();
-  createDefaultPhotos();
+  // 不再放 JOYEUX NOEL 占位卡：相册里只有真实照片
   setupPostProcessing();
   setupEvents();
   cacheUi();
@@ -74,7 +75,7 @@ function initThree() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.toneMapping = THREE.ReinhardToneMapping;
-  renderer.toneMappingExposure = 2.2;
+  renderer.toneMappingExposure = 1.6;
   container.appendChild(renderer.domElement);
   mainGroup = new THREE.Group();
   // 整体下移一点，给顶部标题（Happy New Year / X And H）留出呼吸空间
@@ -109,13 +110,33 @@ function setupLights() {
 function setupPostProcessing() {
   const renderScene = new RenderPass(scene, camera);
   const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
-  bloomPass.threshold = 0.7;
-  bloomPass.strength = 0.45;
+  bloomPass.threshold = 0.75;
+  bloomPass.strength = 0.30;
   bloomPass.radius = 0.4;
+  if (/[?&]nobloom/.test(location.search)) bloomPass.strength = 0;   // 调试：关掉泛光
+  const q = new URLSearchParams(location.search);
+  if (q.has('exp')) renderer.toneMappingExposure = Number(q.get('exp'));
+  if (q.has('bs')) bloomPass.strength = Number(q.get('bs'));
+  if (q.has('bt')) bloomPass.threshold = Number(q.get('bt'));
   composer = new EffectComposer(renderer);
   composer.addPass(renderScene);
   composer.addPass(bloomPass);
+  // 正确的色彩空间 / 色调映射收尾，否则整幅画面会偏亮
+  composer.addPass(new OutputPass());
+
+  // 被特写的那张照片放到 layer 1，渲染时会被主相机跳过，
+  // 之后单独直接画到画布上（见 animate），这样它既不吃泛光也不吃色调映射。
+  photoCamera = camera.clone();
+  photoCamera.layers.set(1);
 }
+
+/** 把某张照片切换到"独立叠加"图层（只有它自己会走叠加渲染） */
+function setPhotoOverlay(mesh, on) {
+  if (!mesh) return;
+  mesh.traverse((o) => { on ? o.layers.set(1) : o.layers.set(0); });
+}
+let photoCamera = null;
+let overlayPhotoMesh = null;
 
 function createTextures() {
   const canvas = document.createElement('canvas');
@@ -284,11 +305,24 @@ function createDefaultPhotos() {
 }
 
 function addPhotoToScene(texture, fullUrl = null) {
-  const frameGeo = new THREE.BoxGeometry(1.4, 1.4, 0.05);
+  // 按原图宽高比生成相框，避免竖图被拉成正方形
+  const img = texture.image;
+  const aspect = (img && img.width && img.height) ? img.width / img.height : 1;
+  const LONG = 1.2;                                   // 长边尺寸
+  const pw = aspect >= 1 ? LONG : LONG * aspect;
+  const ph = aspect >= 1 ? LONG / aspect : LONG;
+
+  const frameGeo = new THREE.BoxGeometry(pw + 0.2, ph + 0.2, 0.05);
   const frameMat = new THREE.MeshStandardMaterial({ color: CONFIG.colors.champagneGold, metalness: 1.0, roughness: 0.1 });
   const frame = new THREE.Mesh(frameGeo, frameMat);
-  const photoGeo = new THREE.PlaneGeometry(1.2, 1.2);
-  const photoMat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+
+  const photoGeo = new THREE.PlaneGeometry(pw, ph);
+  const photoMat = new THREE.MeshBasicMaterial({
+    map: texture,
+    side: THREE.DoubleSide,
+    // 照片要“原图效果”：不参与场景的色调映射/曝光，否则亮部会直接过曝削顶
+    toneMapped: false
+  });
   const photo = new THREE.Mesh(photoGeo, photoMat);
   photo.position.z = 0.04;
   const group = new THREE.Group();
@@ -301,9 +335,11 @@ function addPhotoToScene(texture, fullUrl = null) {
   const particle = new Particle(group, 'PHOTO', false);
   particle.fullUrl = fullUrl;         // 树上用缩略图，大图按需加载
   particle.fullLoaded = false;
+  particle.orderIndex = 1e6 + (photoSeq++);   // 用户上传的排在内置相册之后
   particleSystem.push(particle);
   return particle;
 }
+let photoSeq = 0;
 
 /**
  * 相册：assets/photos/manifest.json 里列着每张图的大图和缩略图路径。
@@ -323,11 +359,14 @@ async function loadGallery() {
     const worker = async () => {
       while (cursor < photos.length) {
         const item = photos[cursor++];
+        const order = photos.indexOf(item);
         try {
           const tex = await loader.loadAsync(`assets/photos/${item.thumb}`);
           tex.colorSpace = THREE.SRGBColorSpace;
           tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-          addPhotoToScene(tex, `assets/photos/${item.full}`);
+          const p = addPhotoToScene(tex, `assets/photos/${item.full}`);
+          p.orderIndex = order;      // 并发加载会乱序，记下相册里的原始位置
+          p.photoId = item.id;
           ok++;
         } catch (e) {
           console.warn('照片加载失败:', item.thumb, e);
@@ -338,9 +377,24 @@ async function loadGallery() {
       Array.from({ length: Math.min(8, photos.length) }, worker)
     );
     console.log(`相册：已加载 ${ok}/${photos.length} 张`);
+    applyDebugPhoto();
   } catch (err) {
     console.warn('相册清单读取失败:', err);
   }
+}
+
+/** 调试用：?photo=35 直接把第 35 张放进特写，方便检查画质 */
+function applyDebugPhoto() {
+  const m = /[?&]photo=(\d+)/.exec(location.search);
+  if (!m) return;
+  const list = photoList();
+  if (!list.length) return;
+  const idx = Math.max(0, Math.min(Number(m[1]), list.length - 1));
+  STATE.mode = 'FOCUS';
+  STATE.focusIndex = idx;
+  STATE.focusTarget = list[idx].mesh;
+  ensureFullTexture(STATE.focusTarget);
+  applyFocusOverlay();
 }
 
 /** 某张照片成为特写时，按需把缩略图换成原图 */
@@ -530,12 +584,24 @@ function applyMode(mode) {
   STATE.focusTarget = null;
   // 进入特写就直接翻到"下一张"，所以每捏一次都是新的一张
   if (mode === 'FOCUS') showPhoto(1);
+  else applyFocusOverlay();
   updateHud(lastPose, true);
   flashHint();
 }
 
+/** 让当前特写的照片走"独立叠加"图层（不吃泛光/色调映射），其余照片回到普通图层 */
+function applyFocusOverlay() {
+  const target = STATE.mode === 'FOCUS' ? STATE.focusTarget : null;
+  if (overlayPhotoMesh && overlayPhotoMesh !== target) setPhotoOverlay(overlayPhotoMesh, false);
+  if (target) setPhotoOverlay(target, true);
+  overlayPhotoMesh = target;
+}
+
 function photoList() {
-  return particleSystem.filter(p => p.type === 'PHOTO');
+  const list = particleSystem.filter(p => p.type === 'PHOTO');
+  // 并发加载会让数组顺序不定，这里按相册清单顺序固定下来，翻页才符合直觉
+  list.sort((a, b) => (a.orderIndex ?? 0) - (b.orderIndex ?? 0));
+  return list;
 }
 
 /** 当前特写照片是第几张（给 UI 显示 3 / 8） */
@@ -560,6 +626,7 @@ function showPhoto(dir) {
   STATE.focusIndex = ((STATE.focusIndex + dir) % list.length + list.length) % list.length;
   STATE.focusTarget = list[STATE.focusIndex].mesh;
   ensureFullTexture(STATE.focusTarget);
+  applyFocusOverlay();
   flashHint();
   updateHud(lastPose, true);
 }
@@ -790,7 +857,20 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.1);
   updateSceneRotation(dt);
   for (const p of particleSystem) p.update(dt, STATE.mode, STATE.focusTarget);
+  if (photoCamera) {
+    photoCamera.position.copy(camera.position);
+    photoCamera.quaternion.copy(camera.quaternion);
+    photoCamera.projectionMatrix.copy(camera.projectionMatrix);
+    photoCamera.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+  }
   composer.render();
+  // 照片叠加层：后处理完成后直接画在画布上，保证照片是原图颜色
+  if (overlayPhotoMesh) {
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    renderer.render(scene, photoCamera);
+    renderer.autoClear = true;
+  }
 }
 
 /**
